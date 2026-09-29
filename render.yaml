@@ -1,0 +1,17 @@
+# Private-room test server. Import this repository as a Render Blueprint.
+services:
+  - type: web
+    name: pickle-arena-relay
+    runtime: docker
+    plan: free
+    region: singapore
+    numInstances: 1
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    healthCheckPath: /health
+    autoDeployTrigger: off
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: MAX_ROOMS
+        value: "20"
