@@ -1,9 +1,11 @@
 import 'dart:io';
 
 import 'relay.dart';
+import 'records.dart';
 
 Future<void> main() async {
   final relay = ArenaRelay(
+    records: SupabaseRecords.fromEnvironment(),
     maxRooms: int.parse(Platform.environment['MAX_ROOMS'] ?? '100'),
   );
   await relay.start(port: int.parse(Platform.environment['PORT'] ?? '8080'));

@@ -1,6 +1,6 @@
 FROM dart:stable AS build
 WORKDIR /app
-COPY relay.dart main.dart ./
+COPY relay.dart records.dart main.dart ./
 RUN dart compile exe main.dart -o /app/relay
 
 FROM scratch

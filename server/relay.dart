@@ -2,17 +2,21 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'records.dart';
 
 /// Private two-player relay. Physics remains on the room creator's phone.
-/// No Flutter imports, database, accounts, or third-party dependencies.
+/// Accounts and durable records are optional; guest clients remain compatible.
 class ArenaRelay {
   ArenaRelay({
     this.maxRooms = 100,
     this.waitingLifetime = const Duration(minutes: 15),
     this.matchLifetime = const Duration(hours: 2),
     this.idleTimeout = const Duration(seconds: 12),
+    this.records,
   });
   final int maxRooms;
+  final MatchRecords? records;
+  final _writes = <Future<void>>{};
   final Duration waitingLifetime, matchLifetime, idleTimeout;
   final _rooms = <String, _Room>{};
   final _clients = <_Client>{};
@@ -122,10 +126,22 @@ class ArenaRelay {
         _disconnect(client);
         return;
       }
+      if (client.authenticating) return;
       final room = client.room;
       if (room == null) {
         if (m['protocol'] != 1) {
           _reject(client, 'version');
+          return;
+        }
+        if (m.containsKey('access_token')) {
+          final token = m['access_token'];
+          if (token is! String || token.isEmpty || token.length > 8192 ||
+              (type != 'create' && type != 'join')) {
+            throw const FormatException();
+          }
+          if (records == null) { _reject(client, 'accounts_unavailable'); return; }
+          client.authenticating = true;
+          unawaited(_authenticate(client, m, token));
           return;
         }
         if (type == 'create') {
@@ -155,12 +171,17 @@ class ArenaRelay {
             _reject(client, 'full');
             return;
           }
+          if (client.userId != null && client.userId == found.host.userId) {
+            _reject(client, 'same_account');
+            return;
+          }
           found.guest = client;
           found.pairedAt = now;
           client.room = found;
           client.send({'type': 'room', 'role': 'guest', 'code': found.code});
-          found.host.send({'type': 'paired'});
-          client.send({'type': 'paired'});
+          final tracked = found.host.userId != null && client.userId != null;
+          found.host.send({'type': 'paired', 'tracked': tracked});
+          client.send({'type': 'paired', 'tracked': tracked});
         } else {
           throw const FormatException();
         }
@@ -196,6 +217,7 @@ class ArenaRelay {
             }
             room.lastSequence = sequence;
             room.pending.add(sequence);
+            _observeResult(room, m['state'] as Map, sequence);
           case 'sound':
             if (m['sound'] is! int ||
                 (m['sound'] as int) < 0 ||
@@ -227,6 +249,13 @@ class ArenaRelay {
             final sequence = m['sequence'];
             if (sequence is! int || !room.pending.contains(sequence)) return;
             room.pending.removeWhere((s) => s <= sequence);
+            final result = room.result;
+            if (result != null && sequence >= result.sequence && !room.submitted) {
+              room.submitted = true;
+              final write = _saveResult(room, result);
+              _writes.add(write);
+              unawaited(write.whenComplete(() => _writes.remove(write)));
+            }
           case 'pause':
           case 'active':
             if (m['value'] is! bool) throw const FormatException();
@@ -239,6 +268,56 @@ class ArenaRelay {
       other.send(m);
     } catch (_) {
       _reject(client, 'invalid');
+    }
+  }
+
+  Future<void> _authenticate(_Client client, Map<String, dynamic> message, String token) async {
+    try {
+      final id = await records!.identify(token);
+      if (client.closed || !_clients.contains(client)) return;
+      if (id == null) { _reject(client, 'auth'); return; }
+      client.userId = id;
+      client.authenticating = false;
+      // Never relay or retain the credential after checking it with Auth.
+      _message(client, jsonEncode({...message}..remove('access_token')));
+    } catch (_) {
+      if (!client.closed) _reject(client, 'auth');
+    }
+  }
+
+  void _observeResult(_Room room, Map state, int sequence) {
+    if (records == null || room.host.userId == null || room.guest?.userId == null) return;
+    final scores = state['scores'];
+    if (scores is! List || scores.length != 2 ||
+        scores.any((s) => s is! int || s < 0 || s > 999)) {
+      return;
+    }
+    final a = scores[0] as int, b = scores[1] as int;
+    if (state['over'] == false && a == 0 && b == 0 && room.submitted) {
+      room.result = null;
+      room.submitted = false;
+      room.matchKey = matchId();
+    }
+    if (state['over'] == true && room.result == null &&
+        max(a, b) >= 11 && (a - b).abs() >= 2) {
+      room.result = (id: room.matchKey, sequence: sequence, hostScore: a, guestScore: b);
+    }
+  }
+
+  Future<void> _saveResult(_Room room, ({String id, int sequence, int hostScore, int guestScore}) result) async {
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        await records!.save(result.id, room.host.userId!, room.guest!.userId!, result.hostScore, result.guestScore);
+        for (final member in [room.host, room.guest]) {
+          member?.send({'type': 'record', 'saved': true});
+        }
+        return;
+      } catch (_) {
+        if (attempt < 2) await Future<void>.delayed(Duration(seconds: attempt + 1));
+      }
+    }
+    for (final member in [room.host, room.guest]) {
+      member?.send({'type': 'record', 'saved': false});
     }
   }
 
@@ -296,6 +375,7 @@ class ArenaRelay {
       _disconnect(client, reason: 'shutdown');
     }
     await server?.close(force: true);
+    await Future.wait(_writes.toList());
   }
 }
 
@@ -309,6 +389,9 @@ class _Room {
   bool hello = false, started = false;
   int lastSequence = 0;
   final pending = <int>[];
+  String matchKey = matchId();
+  bool submitted = false;
+  ({String id, int sequence, int hostScore, int guestScore})? result;
 }
 
 class _Client {
@@ -316,6 +399,8 @@ class _Client {
   final WebSocket socket;
   _Room? room;
   bool closed = false;
+  bool authenticating = false;
+  String? userId;
   final created = DateTime.now();
   DateTime lastSeen = DateTime.now(), window = DateTime.now();
   int messages = 0, bytes = 0;
